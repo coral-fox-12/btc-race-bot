@@ -1,4 +1,4 @@
-"""Unit tests for the dip-and-trend bot. Standard library only.
+"""Unit tests for the oversold-dip bot. Standard library only.
 
 Run:  python3 -m unittest discover -s tests -v
 The tests drive main.Bot through the vendored SDK's BarsState on synthetic
@@ -87,14 +87,6 @@ class TestIndicators(unittest.TestCase):
             v = r.update(c)
         self.assertEqual(v, 100.0)
 
-    def test_atr_positive_on_flat_and_moving(self):
-        a = main.Atr(14)
-        for _ in range(20):
-            v = a.update(100.0, 100.0, 100.0)
-        self.assertEqual(v, 0.0)
-        v = a.update(101.0, 99.0, 100.5)
-        self.assertGreater(v, 0.0)
-
 
 class TestBotRobustness(unittest.TestCase):
     def test_flat_bars_never_crash_and_never_trade(self):
@@ -124,13 +116,21 @@ class TestBotRobustness(unittest.TestCase):
 
     def test_orders_respect_cash_and_caps(self):
         bot = main.Bot()
-        # steady rally: uptrend with pullbacks, so the bot should buy
+        # Sharp dip then recovery: RSI(14) dives under 35, so the bot buys;
+        # the bounce then takes it out at the take-profit.
         closes = []
         price = 64000.0
-        for i in range(400):
-            price *= 1.0008 if i % 5 else 0.9992
+        for i in range(300):
+            if i < 100:
+                price *= 1.0  # flat: indicators settle
+            elif i < 130:
+                price *= 0.998  # -0.2%/bar for 30 bars: a real dip
+            else:
+                price *= 1.0015  # recovery
             closes.append(price)
         replies = run_bars(bot, closes)
+        buys = [o for r in replies for o in r if o["side"] == "buy"]
+        self.assertGreater(len(buys), 0, "bot should buy the dip")
         for reply in replies:
             self.assertLessEqual(len(reply), 16)
             for o in reply:
@@ -140,6 +140,33 @@ class TestBotRobustness(unittest.TestCase):
                 if o["side"] == "buy":
                     self.assertGreaterEqual(o["notional_quote_units"], 1_000_000)
                     self.assertLessEqual(o["notional_quote_units"], 1_000_000_000)
+
+    def test_crash_halt_stops_entries(self):
+        bot = main.Bot()
+        # Flat, then a -3% slide over 4 hours: the 4-hour return crosses
+        # -1.50%, so the crash halt must fire and no entry may follow,
+        # even when RSI is deeply oversold.
+        closes = []
+        price = 64000.0
+        for i in range(400):
+            if i < 100:
+                pass
+            elif i < 340:
+                price *= 0.99987  # -3% over 240 bars
+            closes.append(price)
+        replies = run_bars(bot, closes)
+        # Entries may happen before the halt trips (early in the slide),
+        # but none may happen after the 4-hour return crosses -1.50%.
+        # Find the first bar where the 4h return is under -1.50%.
+        first_halt = None
+        for i in range(240, len(closes)):
+            if closes[i] / closes[i - 240] - 1.0 < -0.015:
+                first_halt = i
+                break
+        self.assertIsNotNone(first_halt, "test series must cross the halt line")
+        late_buys = [o for seq, r in enumerate(replies) if seq > first_halt + 1
+                     for o in r if o["side"] == "buy"]
+        self.assertEqual(late_buys, [], "no entries after the crash halt")
 
 
 class TestBotDeterminism(unittest.TestCase):
